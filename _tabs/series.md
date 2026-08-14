@@ -14,7 +14,7 @@ How can a simulator preserve packet-level visibility without paying for every
 packet event? This series studies parallel discrete-event simulation, workload
 structure, approximation boundaries, and reproducibility.
 
-- [Wormhole: Memoization and Fast-Forwarding for Packet-Level LLM Network Simulation](/posts/wormhole-memoization-fast-forwarding/)
+- [ns-3 为什么一跑就是几周？Wormhole 怎样把重复仿真直接“剪掉”](/posts/wormhole-memoization-fast-forwarding/)
 - [Browse the complete series](/categories/network-simulation-acceleration/)
 
 More tracks will be added as the notes grow.

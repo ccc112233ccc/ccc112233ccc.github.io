@@ -1,26 +1,314 @@
 ---
-title: "Wormhole：怎样把大模型包级网络仿真推进到 1000×"
+title: "ns-3 为什么一跑就是几周？Wormhole 怎样把重复仿真直接“剪掉”"
 date: 2026-08-14 15:00:00 +0800
 categories: [Network Simulation Acceleration, Paper Notes]
 tags: [Wormhole, ns-3, LLM Training, Network Simulation, Memoization, Fast-Forwarding]
-description: "逐层拆解 NSDI '26 Wormhole：端口级网络分区、FCG 记忆化、稳态识别、事件快进、实验口径，以及论文与公开 artifact 之间的差距。"
+description: "用一个四 GPU 的例子看懂 Wormhole：哪些包事件可以复用，什么时候能够安全快进，以及论文里的 1000× 到底从哪里来。"
 image:
   path: /assets/img/posts/wormhole/hero-wormhole.png
-  alt: Wormhole uses memoization for unsteady states and fast-forwarding for steady states.
+  alt: Wormhole recognizes repeated unstable periods and fast-forwards stable periods.
 math: true
 mermaid: true
 toc: true
 pin: true
 ---
 
-包级网络仿真最昂贵的地方，恰好也是它最值得保留的地方：每一个包、队列变化和拥塞控制反馈都被建模。Wormhole 的思路不是把 ns-3 换成粗粒度估算器，而是问一个更锋利的问题：**如果某段逐包过程已经算过，或者系统已经进入几乎不再变化的稳态，为什么还要把相同的离散事件再执行一遍？**
+你想测试一个 1024-GPU 训练集群的新拥塞控制算法。真机太贵，于是把通信过程交给 ns-3；结果模型只训练一轮，仿真器却可能要跑上几周。
 
-这篇文章完整拆解 NSDI '26 论文 *Supercharging Packet-level Network Simulation of Large Model Training via Memoization and Fast-Forwarding*。除了论文方法，我还检查了作者留下的匿名 artifact、它与最终论文的实现差距，以及几个容易被标题数字掩盖的实验口径问题。
+慢的不是“训练”，而是仿真器太认真：一个包什么时候发、在哪排队、何时收到 ACK、拥塞窗口怎样变化，它都要逐件处理。Wormhole 的想法是：**保留包级仿真，但认出那些以前演过、或者已经不再变化的片段，直接剪掉。**
 
-> 先给结论：Wormhole 抓住了大模型训练流量中非常真实的两类冗余，设计也比“直接跳时间”细致得多；但目前能访问的代码只是早期原型，**不足以独立复现最终论文的 744× / 1012× 结论**。
-{: .prompt-warning }
+读完这篇，你应该能用自己的话回答三个问题：Wormhole 剪掉了什么、为什么它敢剪，以及论文里的 1000× 到底是什么口径。
 
-## Paper card
+## 30 秒版：它其实只做了两件事
+
+先把一条流的发送速率想成视频时间线。
+
+```mermaid
+flowchart LR
+    A["速率还在抖<br/>第一次遇见"] --> B["正常逐包模拟<br/>顺手记住结果"]
+    B --> C["速率稳定<br/>直接快进"]
+    C --> D["新流 / 流结束<br/>恢复正常播放"]
+    E["相同抖动再次出现"] --> F["命中旧记录<br/>连收敛过程也跳过"]
+
+    classDef transient fill:#fff0d5,stroke:#e59b2f,color:#422b00;
+    classDef stable fill:#e6f6df,stroke:#58a55c,color:#173d1a;
+    classDef cache fill:#e2efff,stroke:#4d85c5,color:#153a63;
+    classDef interrupt fill:#ffe3e0,stroke:#d95d50,color:#5b1914;
+    class A,B transient;
+    class C stable;
+    class E,F cache;
+    class D interrupt;
+```
+
+_自绘图 1：黄色是尚未稳定的过程，绿色是可以快进的稳定区间，蓝色是缓存复用，红色是必须停下来的扰动。_
+
+论文给这两件事起了正式名字：
+
+- 以前算过的不稳定过程，使用 **memoization（记忆化）**复用；
+- 拥塞控制收敛后的稳定过程，使用 **fast-forwarding（快进）**跳过。
+
+到这里先只记住一句：**Wormhole 不是让每个包算得更快，而是让绝大多数包事件不必再次执行。**
+
+## 为什么不直接换一个更粗的模拟器？
+
+如果只关心“一条流平均能分到多少带宽”，flow-level 模拟器确实快得多。但新拥塞控制算法最容易出问题的，往往正是平均值下面的细节：队列突然堆积、ECN 标记、丢包、RTT 抖动，以及发送端收到反馈后怎样调速。
+
+把它类比成高速公路：flow-level 模拟只告诉你“这条路平均每分钟过 100 辆车”；packet-level 模拟则会看到每辆车在哪个收费口排队、哪一秒开始堵。Wormhole 不想拆掉摄像头，它只是给录像加上“识别重复片段”和“稳定路段倍速播放”。
+
+这个类比也有边界：网络里还有 ACK、共享缓存、ECN、PFC 等精确机制，不能真拿公路模型做数值计算。它只帮助我们理解为什么“保留细节”和“少执行事件”可以同时成立。
+
+## 训练流量里，真的有那么多片段可以剪吗？
+
+大模型训练会一轮轮重复相同的 collective。相同 GPU、相同并行策略和相同路径，会让“哪些流在抢同一段链路”反复出现；长达 GB 级别的 data-parallel 流一旦调稳，后面又有很长一段时间几乎没有新剧情。
+
+看下面这张论文原图时，不必盯每根柱子，只看两个数字：真实 GPT-18B trace 里，65,870 次争用只对应 1,488 种不同模式；稳定状态占了 98.82% 的时间。
+
+![LLM 训练中的重复模式与稳态占比](/assets/img/posts/wormhole/figure-03-redundancy.png)
+_论文 Figure 3：左图统计重复 contention pattern，右图统计 steady-state 占比。它证明这些 workload 里冗余很多，但还不能证明任意多租户网络也一样。来源：Long et al., NSDI '26。_
+
+合成 workload 中，dense GPT 的稳态占比超过 99%，MoE 大约 97.5%。MoE 更低也符合直觉：expert parallel 的 all-to-all 更动态，流之间的关系没有 dense training 那么整齐。
+
+## 用四张 GPU，把整个过程走一遍
+
+先不看论文里的大拓扑。假设只有四张 GPU，正在发送四条 flow：GPU 0 和 GPU 1 会抢链路 A；GPU 2 和 GPU 3 会抢链路 B。A、B 彼此不共享链路。
+
+```mermaid
+flowchart LR
+    G0["GPU 0<br/>Flow 0"] --> A["共享链路 A"]
+    G1["GPU 1<br/>Flow 1"] --> A
+    G2["GPU 2<br/>Flow 2"] --> B["共享链路 B"]
+    G3["GPU 3<br/>Flow 3"] --> B
+    A --> P1["小组 1<br/>可以单独推进"]
+    B --> P2["小组 2<br/>可以单独推进"]
+
+    classDef gpu fill:#f2f4f7,stroke:#6b7280,color:#20252b;
+    classDef a fill:#fff0d5,stroke:#e59b2f,color:#422b00;
+    classDef b fill:#e6f6df,stroke:#58a55c,color:#173d1a;
+    class G0,G1,G2,G3 gpu;
+    class A,P1 a;
+    class B,P2 b;
+```
+
+_自绘图 2：只要两条流抢过同一条链路，它们就放进同一个小组。两个小组没有共享链路，可以各走各的时间线。_
+
+现在让仿真跑两轮 collective：
+
+1. 第一轮，小组 1 的流刚启动，速率还在变化。Wormhole 没见过这种争用，只能老实逐包模拟，并把“开始时长什么样、最后怎样稳定”存下来；
+2. 速率稳定后，只要没有新流、旧流完成或重路由，Wormhole 按平均速率把这段时间直接推过去；
+3. 第二轮，完全相同的争用再次出现。Wormhole 找到第一轮的记录，连前面的调速过程也复用；
+4. 某条新流进入，小组关系改变，快进立即停止并重新分组。
+
+读完这个例子，整篇论文已经完成了七成。后面的 partition、FCG、steady-state detection，只是在回答：**怎样让这四步既快，又不把模拟结果弄错。**
+
+## Wormhole 怎么知道哪些流可以分开处理？
+
+刚才的“小组”就是论文里的 **network partition**。规则不是“在同一台交换机上”，而是“是否共享同一条 link / port”。共享链路的 flow 会互相影响，必须放在一起；没有共享链路的 partition 才能分别快进。
+
+实现时，Wormhole 画一张 flow–link 二部图：flow 经过某条 link 就连边，再用 DFS 找连通分量。新流到来时只合并它碰到的 partition；流结束时也只检查原来的 partition 是否需要拆开，不必重算全网。
+
+![端口级 network partition 与 Flow Conflict Graph](/assets/img/posts/wormhole/figure-04-partition-fcg.png)
+_论文 Figure 4：左侧是正式版 partition，右侧是下一节要用的 FCG。原图比玩具例子完整，但读法相同：橙色和绿色代表两个可分别推进的流集合。来源：Long et al., NSDI '26。_
+
+需要警惕的是，不共享链路不等于物理世界里完全无关。不同端口仍可能共享交换机 buffer、PFC headroom 或内部调度。论文后面专门补了一个“冻结缓存占用”的机制，但这仍是一条需要验证的近似边界。
+
+**所以 partition 省掉了什么？** 它避免“一条新流让整个网络都不能快进”，把影响限制在真正共享链路的小范围里。
+
+## Wormhole 怎么认出“这段拥堵以前见过”？
+
+只比较 flow 数量肯定不够。四条流可以互不相干，也可以全部挤在一条链路上。Wormhole 真正比较的是“谁和谁抢路”。
+
+它把每个 partition 压成一张 Flow Conflict Graph，简称 **FCG**：
+
+- 点是一条 flow，点上的数字是当前发送速率；
+- 两条 flow 共享过链路，就连一条边；
+- 边上的数字是二者重叠的链路数量。
+
+```mermaid
+flowchart TB
+    subgraph FIRST["第一次遇见"]
+      S1["当前争用关系"] --> Q1{"缓存里有吗？"}
+      Q1 -->|没有| SIM["逐包模拟到稳定"]
+      SIM --> SAVE["保存开始、结局和耗时"]
+    end
+    subgraph AGAIN["第二次遇见"]
+      S2["同构的争用关系"] --> Q2{"缓存里有吗？"}
+      Q2 -->|命中| REUSE["直接复用上次结局"]
+    end
+    SAVE -.下一轮.-> Q2
+
+    classDef transient fill:#fff0d5,stroke:#e59b2f,color:#422b00;
+    classDef cache fill:#e2efff,stroke:#4d85c5,color:#153a63;
+    class S1,Q1,SIM transient;
+    class SAVE,S2,Q2,REUSE cache;
+```
+
+_自绘图 3：第一次 cache miss 仍然要逐包模拟；第二次匹配到同构 FCG，才有资格复用。_
+
+数据库不用保存每一个瞬间，只保存开始时的 FCG，以及结束时的 FCG、每条流在这段时间发了多少数据、花了多久收敛。查找时先按点数和边数过滤，再做 weighted graph isomorphism。
+
+这里最脆弱的假设也出现了：FCG 忽略绝对路径长度和拓扑位置。两个图看起来同构，但若 RTT、链路容量、队列状态、ECN/PFC 配置不同，调速过程未必相同。一个稳妥实现还应把完整网络配置放进 cache namespace；论文没有把这个 key 列清楚。
+
+**所以 FCG 省掉了什么？** 它省掉重复执行的 CCA 收敛过程，但只有 cache hit 时才省得到。
+
+## 只看发送速率，怎样判断“真的稳定了”？
+
+先不用公式。假设最近几次采样得到 `98、100、102 Gbps`，平均是 `100`，最高和最低只差 `4`，相对波动就是 `4%`。如果容许阈值是 `5%`，这条 flow 可以被判为稳定。
+
+论文把这个判断写成：
+
+$$
+\Delta R_l(t)=
+\frac{\max R(t_k)-\min R(t_k)}
+{\frac{1}{l}\sum_{k=1}^{l}R(t_k)}<\theta
+$$
+
+$l$ 是连续观察多少次，$\theta$ 是允许抖动多大。论文实验默认 $l=2000$、$\theta=5\%$。阈值越大，越容易提前宣布稳定，通常会更快，也更容易引入误差；窗口越长，判断越保守，进入快进也越晚。
+
+论文进一步证明：在 CCA 已经收敛的前提下，发送速率稳定时，拥塞窗口、RTT、队列长度和 in-flight bytes 也会保持在小范围内。但请注意这个前提：有限窗口只能观察“最近看起来稳定”，它不能彻底排除更晚才出现的长周期变化。
+
+<details markdown="1">
+<summary>想看严谨版本：论文究竟保证了多少误差？</summary>
+
+论文给出的 rate estimation 相对误差上界为：
+
+$$
+\left|\frac{\hat R-R}{R}\right|<\frac{\theta}{1-\theta}
+$$
+
+steady duration 的相对误差上界为：
+
+$$
+\left|\frac{\hat T-T}{T}\right|<\theta
+$$
+
+代入 $\theta=5\%$，两个上界分别约为 5.26% 和 5%。所以论文实验里的“平均 FCT 误差小于 1%”不是这两个定理直接保证出来的 worst case，而是特定 workload 上的观测结果。相关证明位于论文明确标记为“未同行评审 supporting material”的附录。
+
+</details>
+
+**所以稳态识别省掉了什么？** 它省掉的是收敛以后那段又长、又几乎没有新信息的逐包事件。
+
+## 快进时间，为什么不会把别的流弄乱？
+
+“把时钟往前拨”是危险的。小组 1 可能已经稳定，小组 2 还在激烈变化；如果直接修改 global clock，两个小组的因果顺序会被打乱。
+
+```mermaid
+flowchart LR
+    CLOCK["全局时钟<br/>继续正常走"] --> P1["Partition 1<br/>事件时间 + ΔT"]
+    CLOCK --> P2["Partition 2<br/>继续逐包模拟"]
+    P1 --> HOLD["冻结该端口<br/>当前 buffer 占用"]
+    HOLD --> ALARM["最早扰动到来<br/>停止快进"]
+
+    classDef base fill:#f2f4f7,stroke:#6b7280,color:#20252b;
+    classDef stable fill:#e6f6df,stroke:#58a55c,color:#173d1a;
+    classDef interrupt fill:#ffe3e0,stroke:#d95d50,color:#5b1914;
+    class CLOCK,P2 base;
+    class P1,HOLD stable;
+    class ALARM interrupt;
+```
+
+_自绘图 4：不动全局时钟，只偏移当前 partition 的事件；同时保留它对共享缓存的占用，遇到扰动立即停。_
+
+Wormhole 的处理分三步：
+
+1. 不改 global clock，只把当前 partition 的事件 timestamp 整体加上 $\Delta T$；
+2. 暂停对应端口的 packet processing，冻结已有 buffer occupancy，避免其他端口凭空多出缓存；
+3. 把新流进入、旧流完成、重路由当成“闹钟”。最早的闹钟决定能跳多远。
+
+如果某个实时事件事先不知道，论文还提出 skip-back：事件虽然已被推到未来，但只要全局时钟还没走到那里、那些事件尚未执行，就可以把 partition 拉回更早的时间点。
+
+![Packet pausing、timestamp offset 与 skip-back](/assets/img/posts/wormhole/figure-07-runtime-details.png)
+_论文 Figure 7：正式实现需要同时处理 packet pausing、partition timestamp offset 和实时事件回退；这张图证明“快进”并不是简单修改一行时钟。来源：Long et al., NSDI '26。_
+
+**所以这组实现省掉了什么？** 它没有再省更多事件，而是让前面的“剪片段”不至于破坏其他 partition 看得见的状态。
+
+## 论文里的 1000×，主要是谁贡献的？
+
+先猜一下：是 16 个 CPU 核并行带来的，还是少执行事件带来的？答案主要是后者。
+
+论文的 breakdown 显示，只做 steady-state skipping，GPT workload 已经超过 130×，MoE 超过 50×；在此基础上，memoization 再提供 1.93×–8.43×。两者合计跳过 GPT 超过 99.5%、MoE 超过 99.2% 的事件。
+
+![稳态跳过、memoization 和事件跳过比例](/assets/img/posts/wormhole/figure-09-breakdown.png)
+_论文 Figure 9：左边先看 steady-state skipping 的虚线，再看完整 Wormhole 的实线；右边显示超过 99% 的事件被跳过。它说明主要收益来自“少算”，但不代表所有流量都能保持这个跳过率。来源：Long et al., NSDI '26。_
+
+完整数字要分三种口径看：
+
+```mermaid
+flowchart LR
+    ONE["单核 Wormhole<br/>GPT 最高 744×<br/>MoE 510×"] --> MULTI["再叠加 16 核 Unison<br/>GPT 1012×<br/>MoE 716×"]
+    MULTI --> REAL["真实 GPT-18B trace<br/>Wormhole 97.75×<br/>加 Unison 133.35×"]
+
+    classDef cache fill:#e2efff,stroke:#4d85c5,color:#153a63;
+    classDef stable fill:#e6f6df,stroke:#58a55c,color:#173d1a;
+    classDef real fill:#fff0d5,stroke:#e59b2f,color:#422b00;
+    class ONE cache;
+    class MULTI stable;
+    class REAL real;
+```
+
+_自绘图 5：千倍峰值来自理想化 workload 加多核并行；真实 trace 仍接近百倍，但不是千倍。_
+
+需要警惕一处明显的数字矛盾：论文同时写“GPT-13B 从 9 小时降到 5 分钟”并称“超过 1000×”。但 $9\text{ hours}/5\text{ minutes}=108\times$；若真是 1012×，9 小时应该降到约 32 秒。Figure 8 的曲线确实接近千倍，所以绝对时间或文字至少有一处写错了。
+
+## “误差不到 1%”应该怎样理解？
+
+先把两个经常被混在一起的结果拆开：
+
+| 场景 | 指标 | Wormhole 结果 |
+| --- | --- | --- |
+| SimAI 生成的理想 workload | 平均 per-flow FCT 相对误差 | `<1%` |
+| 真实 256-GPU GPT-18B trace | 端到端训练时间误差 | `3.02%` |
+
+合成实验里，flow-level simulator 的平均 FCT 误差大约 20%，Wormhole 低于 1%。这说明在论文测试的网络规模和三种 CCA 上，剪事件没有明显破坏 FCT；但指标是平均值，不是 p99、最大误差或逐包轨迹的 worst-case guarantee。
+
+真实 trace 更值得看：Wormhole 是 97.75×，Wormhole+Unison 是 133.35×；端到端误差 3.02%，和 ASTRA-sim+ns-3 的 3.01% 几乎相同。
+
+![真实 GPT-18B trace 上的速度与端到端误差](/assets/img/posts/wormhole/figure-14-real-trace.png)
+_论文 Figure 14：左边是实际加速，右边是端到端训练时间误差。它支持“真实 trace 仍有约百倍收益”，但论文只有一个真实训练场景。来源：Long et al., NSDI '26。_
+
+论文还测了每个场景**第一条 flow**的 packet RTT，NRMSE 低于 0.005。这是有价值的 packet-level fidelity 证据，但范围比“所有 flow、所有 packet、所有 loss/queue tail”窄，不能外推成所有微观指标都完全保真。
+
+## 什么样的场景最适合 Wormhole？
+
+它最喜欢这样的 workload：并行策略固定、collective 周期重复、data-parallel elephant flow 很长、路径稳定、扰动能够提前知道。做同一训练系统的大量 design-space sweep 时，这些条件尤其常见。
+
+它不太喜欢：短流很多、租户随机加入、频繁 reroute、链路故障密集、负载均衡持续改变路径。论文说最坏情况下会退化回 ns-3 baseline，但没有画出一个强随机、多租户 workload 的完整退化曲线。
+
+我的理解是：Wormhole 保住的是“足够重建 FCT 和末态的包级基座”，不是把被跳过区间里的每个 microburst、ECN 序列、PFC pause 和瞬时队列波形继续保留下来。若研究目标正是这些瞬态细节，就不应该跳过它们。
+
+## 代码真的开源了吗？
+
+截至 2026-08-14，USENIX 和 arXiv 页面都没有给出最终 Wormhole 的正式 GitHub 仓库。不过，作者上传的 arXiv LaTeX 源码里有一个被注释掉的 [anonymous.4open.science artifact](https://anonymous.4open.science/api/repo/Wormhole/zip)。我下载并检查了它。
+
+这个快照更像 2025 年初的早期 steady-state-skipping prototype，而不是最终论文的完整实现：
+
+| 能看到 | 没看到或没有启用 |
+| --- | --- |
+| QP 发送速率采样与稳态判定 | FCG、图同构查询和 memoization database |
+| 估计下一个 flow arrival / completion | 活跃的动态 port-level partition；相关代码主要被注释 |
+| 扣减剩余字节并偏移 simulator event | 每个 partition 独立 timestamp offset |
+| 基于 Alibaba HPCC ns-3 的修改，GPL v2 | packet pausing、完整 skip-back、Unison 并发数据库 |
+
+快照里还硬编码了 $l=1000,\theta=3\%$，与论文默认的 $l=2000,\theta=5\%$ 不同；README 主要仍是上游 HPCC 文档，构建依赖老旧的 gcc-5 / Python 2，也没有足以复现 headline 结果的测试和日志。
+
+所以最准确的说法是：**公开快照能证明作者做过“稳态检测 + 事件快进”的早期主干，但不能独立复现最终论文的 744× / 1012×。**
+
+## 这篇论文最强、也最脆弱的地方是什么？
+
+我认为它最强的三点是：
+
+1. 找对了瓶颈：不是继续堆 CPU，而是直接消除重复事件；
+2. 三个抽象能互相接上：partition 管依赖，FCG 管重复，rate window 管稳定；
+3. 真实 trace 虽然从千倍降到百倍，仍然有明显工程价值。
+
+最脆弱的三点是：
+
+1. FCG 同构是否足够代表相同 transient，依赖配置域和网络状态；
+2. 高收益依赖训练流量的强重复、长稳态，随机 workload 证据不足；
+3. 最终实现没有正式公开，论文数字无法由现有 artifact 闭环复现。
+
+另外还有两处值得记录的论文笔误：Figure 12 和判定式显示 $l$ 增大会降低 speedup、$\theta$ 增大会提高 speedup，正文却把方向写反；Appendix H 文字说 1024 GPU 的数据库 `<100 KB`，同页 Figure 15b 则大约是 370–510 KB。后一个数字仍然不到 0.6 MB，不影响“可内存驻留”的结论，但不能照抄 `<100 KB`。
+
+## 论文信息放在最后，也来得及
 
 | 项目 | 内容 |
 | --- | --- |
@@ -29,315 +317,16 @@ pin: true
 | 发表 | 23rd USENIX NSDI, 2026, pp. 1131–1151 |
 | 正式页面 | [USENIX presentation page](https://www.usenix.org/conference/nsdi26/presentation/long) |
 | 正式论文 | [USENIX PDF](https://www.usenix.org/system/files/nsdi26-long.pdf) · [arXiv](https://arxiv.org/abs/2602.10615) |
-| 可访问代码 | [匿名预发布 artifact](https://anonymous.4open.science/api/repo/Wormhole/zip)，不是最终版本的完整实现 |
-| 阅读范围 | 正文、全部图表、Table 1 与 Appendices A–I |
+| 可访问代码 | [匿名预发布 artifact](https://anonymous.4open.science/api/repo/Wormhole/zip)，不是最终完整实现 |
 
-## 一句话理解 Wormhole
+## 最后三句话
 
-Wormhole 仍然把 PLDES（packet-level discrete-event simulation）当作正确性基座，但把可省略的时间分成两种：
-
-1. **Unsteady state**：拥塞控制正在收敛。如果同构的流冲突模式以前模拟过，直接复用结果；
-2. **Steady state**：发送速率已经稳定。用测得的平均速率推进到下一次扰动，不再逐包执行中间事件。
-
-![Wormhole 的 memoization 与 fast-forwarding](/assets/img/posts/wormhole/figure-01-overview.png)
-_Figure 1. 黄色是不稳态，绿色是稳态；第一次出现的不稳态被记住，重复出现时命中缓存。来源：Long et al., NSDI '26, Figure 1。_
-
-它减少的是**事件数量**；Unison 一类并行 DES 优化的是**事件如何分给多个 CPU 核**。两者因此可以叠加，而不是互相替代。
-
-```mermaid
-flowchart LR
-    A[Packet-level events] --> B{当前 partition}
-    B -->|Unsteady| C{FCG 命中?}
-    C -->|No| D[逐包模拟并写入 DB]
-    C -->|Yes| E[复用收敛结果]
-    B -->|Steady| F[按平均速率 fast-forward]
-    D --> G[下一扰动事件]
-    E --> G
-    F --> G
-```
-
-## 为什么一次训练仿真会慢到数周
-
-训练一个大模型会持续产生 data parallel、pipeline parallel 和 expert parallel 通信。这里不只是流很多：大量 collective 会形成 GB 级 elephant flows，而包级模拟器要按时间顺序处理发送、入队、出队、ACK、ECN、丢包和拥塞窗口更新。论文估计，大规模场景可以超过 $O(10^{12})$ 个离散事件；ASTRA-sim 接 ns-3 模拟 GPT-175B 的一个 iteration 可达到“数周”量级。
-
-常见的加速路线各有代价：
-
-| 路线 | 做法 | 论文指出的问题 |
-| --- | --- | --- |
-| Flow-level | 用 max-min fairness 等方式直接分配流带宽 | 快，但难以保留排队、丢包和 CCA 瞬态；实验约 20% 平均 FCT 误差 |
-| 学习或解析近似 | 用模型预测网络性能 | 依赖训练分布或简化假设，跨协议与拓扑泛化困难 |
-| Parallel DES | 在多个核上执行事件 | 同步和负载不均使加速次线性；论文中的 Unison 峰值不到 10× |
-| Wormhole | 避免执行可复用、可跳过的事件 | 需要可靠识别“什么真的可以不算” |
-
-Wormhole 最重要的判断是：LLM 训练网络不是一般的随机互联网流量。固定并行策略会重复相同的 collective，拥塞控制收敛后又会长时间维持相似的速率，因此事件流里存在非常高的结构性冗余。
-
-![LLM 训练中的重复模式与稳态占比](/assets/img/posts/wormhole/figure-03-redundancy.png)
-_Figure 3. 左：重复 contention pattern 的数量；右：steady-state 占比。真实 256-GPU GPT-18B trace 同样表现出高重复与高稳态比例。来源：论文 Figure 3。_
-
-论文报告：
-
-- 128 GPU 的 GPT-13B / MoE-8×7B，每轮有超过 1,200 次重复模式；
-- 1024 GPU 的 GPT-175B / MoE-32×22B，接近 40,000 次；
-- 真实 GPT-18B trace 中，65,870 个 pattern instances 只对应 1,488 个 distinct patterns；
-- dense GPT 的稳态占比超过 99%，MoE 约 97.5%，真实 trace 为 98.82%。
-
-这就是论文的基本赌注：**不是近似整个网络，而是精确找出逐包执行中重复、稳定的部分。**
-
-## 第一步：把网络切成可以独立推进的 partition
-
-直接判断“整个网络是否稳态”几乎没有用：只要某个角落有新流进入，全网都不能快进。Wormhole 因此先做 port-level network partitioning。
-
-定义很直接：如果两条 flow 共享一条 link / port，它们属于同一个连通分量；不共享链路的 flow 集合可以独立处理。实现上构造 flow–link 二部图，再用 DFS 找 connected components。
-
-![端口级 network partition 与 Flow Conflict Graph](/assets/img/posts/wormhole/figure-04-partition-fcg.png)
-_Figure 4. 左：共享端口的 flows 被划入同一 partition；右：两个 partition 被压缩成 FCG。来源：论文 Figure 4。_
-
-端口粒度比 switch 粒度更重要：同一台交换机上的两个端口可能没有相同链路依赖，只按交换机切分会把本来独立的流绑在一起，减少稳态识别和并行机会。
-
-论文把静态 partition 算法写成 $O(N+M)$。严格地说，更完整的复杂度应是 $O(V+E)$：除了 flow 和 link 顶点，还要计入“flow 经过 link”产生的全部 incidence edges。对于路径很长的场景，这个差别不只是记号问题。
-
-动态变化时不需要重算全网：
-
-- 新流不触及现有 partition：新建一个；
-- 新流触及一个：加入其中；触及多个：局部合并并重算；
-- 流结束后：只检查它原来的 partition 是否需要分裂。
-
-一个 partition 只有在**所有 flow 都稳定**时才被认为稳定。这个保守条件牺牲了一些跳过机会，换来更清楚的依赖边界。
-
-## 第二步：用 FCG 记住不稳态
-
-不稳态是 CCA 从初始条件走向收敛的过程，通常难以解析求解。Wormhole 不预测这段轨迹，而是把第一次真实模拟的结果缓存起来。
-
-### FCG 是什么
-
-Flow Conflict Graph（FCG）是一个无向加权图：
-
-- vertex 代表 flow，vertex weight 是当前发送速率；
-- 两条 flow 至少共享一条 link，就连一条 edge；
-- edge weight 是二者重叠 link 的数量。
-
-这个抽象保留“谁和谁争用多少条链路”，但刻意忽略绝对路径长度和流在拓扑中的空间位置。作者认为由此产生的误差可忽略，但论文没有给出一个覆盖所有拓扑的独立消融；不同 RTT、link capacity、queue state、ECN/PFC 配置或 CCA internal state 可能产生同构 FCG，却走出不同 transient。一个稳妥实现还应把完整的网络配置域纳入 cache namespace，而论文没有列清这部分 key。
-
-缓存的形式可以写成：
-
-$$
-\text{key}=FCG_{start}
-$$
-
-$$
-\text{value}=\left(FCG_{end},\{Size_f\}_{f\in F},T_{conv}\right)
-$$
-
-它不保存完整时间序列，只保存收敛前后的 FCG、每条流在不稳态传输的数据量，以及 convergence time。
-
-查询时，先按 vertex / edge 数过滤明显不匹配的候选，再做 weighted graph isomorphism。命中后，按同构映射把缓存结果还原到当前 flow；未命中才逐包模拟，并在结束后写入数据库。
-
-![Wormhole 总体工作流](/assets/img/posts/wormhole/figure-06-workflow.png)
-_Figure 6. 黄色区域对不稳态做查询与 memoization，绿色区域识别并跳过稳态；flow enter/exit 等事件会让 partition 重建。来源：论文 Figure 6。_
-
-这里有个容易误读的点：memoization 并不是千倍加速的主因。论文的 breakdown 显示，在已经跳过稳态之后，memoization 再提供约 1.93×–8.43×；最大的收益仍来自稳态 fast-forwarding。
-
-## 第三步：只看发送速率，能否判断稳态
-
-论文先把 flow 的稳态定义为：在区间 $[t_s,t_f]$ 内，发送速率 $R$、拥塞窗口 $cwnd$、RTT、队列长度 $Q$ 和 in-flight bytes $I$ 的最大值与最小值之差都足够小。
-
-实现中若同时监控五个量，开销大且重复。Wormhole 实际只采样发送速率。对长度为 $l$ 的窗口：
-
-$$
-\Delta R_l(t)=
-\frac{\max_{1\le k\le l}R(t_k)-\min_{1\le k\le l}R(t_k)}
-{\frac{1}{l}\sum_{k=1}^{l}R(t_k)}
-$$
-
-当 $\Delta R_l(t)<\theta$，flow 被判定为进入稳态，稳态速率用窗口均值估计：
-
-$$
-\hat R=\frac{1}{l}\sum_{k=1}^{l}R(t_k)
-$$
-
-实验默认 $\theta=5\%$、$l=2000$。
-
-### 论文给出的理论保证
-
-Theorem 1 在“CCA 已收敛”的前提下，分别借助 HPCC、TIMELY 和 DCTCP 的动力学关系说明：若 $R$ 的波动足够小，$cwnd$、RTT、$Q$ 与 $I$ 也存在有限的小波动。
-
-Theorem 2 给出稳态平均速率估计的相对误差上界：
-
-$$
-\left|\frac{\hat R-R}{R}\right|<\frac{\theta}{1-\theta}
-$$
-
-Theorem 3 给出稳态持续时间估计的相对误差：
-
-$$
-\left|\frac{\hat T-T}{T}\right|<\theta
-$$
-
-当 $\theta=5\%$ 时，这两个上界分别是 5.26% 和 5%。因此，“平均 FCT 误差小于 1%”是**实验结果**，不是理论保证。理论证明也依赖所分析 CCA 的收敛模型，并不能自动外推到任意自定义控制器。
-
-Appendix F 进一步说明：$\theta$ 应略高于 CCA 本身的周期性波动；$l$ 至少覆盖一个 CCA 周期。窗口太短会把局部片段误当成稳定，太长则进入稳态太晚，损失加速。需要注意，承载这些证明的 Appendices 在论文中明确标记为 supporting material，未经过同行评审。
-
-## 第四步：快进时间，但不破坏共享状态
-
-“检测到稳态后把时钟加一段”听起来简单，真正实现却有两个坑。
-
-### 1. 不能移动全局时钟
-
-不同 partition 可能处在不同阶段。Wormhole 保持 ns-3 的 global clock 正常前进，只把目标 partition 关联事件的 timestamp 整体增加 $\Delta T$，同时更新流的 remaining size 与 sequence number。
-
-### 2. 不能让稳态流从共享 buffer 中消失
-
-两个 partition 虽然不共享 link，仍可能使用同一交换机的 shared buffer。如果快进时直接把稳态流的包清空，其他端口会凭空获得更多缓存，丢包时机也会改变。论文的处理是暂停目标 port 的 packet processing，并冻结其 buffer occupancy，直到退出稳态。这保住了静态占用，但不一定重现动态 shared-buffer threshold、PFC headroom、跨端口调度或周期性 ECN / loss；因此 partition 更接近“可管理的近似边界”，而不是数学上完全无耦合的子网。
-
-![Packet pausing、timestamp offset 与 skip-back](/assets/img/posts/wormhole/figure-07-runtime-details.png)
-_Figure 7. 进入稳态后暂停端口事件并把 partition 的时间戳偏移到最早 interrupt；未知实时事件出现时执行 skip-back。来源：论文 Figure 7。_
-
-能够结束稳态的事件有三类：新流进入、旧流完成、现有流 reroute（例如链路故障或负载均衡）。若时间已知，最早 interrupt timestamp 就是快进终点；若事件实时到来，论文提出 skip-back：partition 的事件虽然已被推到 $T_1$，但只要全局时钟尚未到 $T_1$、这些事件还未执行，就可以退回更早的 $T_2$。
-
-## 评估：标题里的 1000× 是怎样得到的
-
-### 实验设置
-
-| 维度 | 设置 |
-| --- | --- |
-| 机器 | 2× Intel Xeon，共 56 cores，128 GB RAM |
-| 网络 | 64 / 128 / 256 / 1024 GPU，4 个 Rail-Optimized Fat-tree 规模 |
-| 模型 | GPT 7B–175B；MoE 8×7B–32×22B |
-| 通信 | DP、PP、EP；按现有模拟器惯例忽略 TP / SP flow |
-| CCA | HPCC、DCQCN、TIMELY |
-| 默认参数 | $\theta=5\%$，$l=2000$ |
-| 基线 | ns-3、Unison、flow-level simulator；真实 trace 另比较 ASTRA-sim+ns-3 |
-
-每个 GPU 在模拟中被当作一个 host，micro-batch size 为 1，global batch 为 $DP\times PP$。结果因此不是对所有训练配置的无条件结论，而是对论文所构造的一轮训练 workload 的测量。
-
-### 速度
-
-![不同网络规模和 CCA 下的加速](/assets/img/posts/wormhole/figure-08-speedup.png)
-_Figure 8. 单核 Wormhole 与 16-core Wormhole+Unison 相对 ns-3 的加速。来源：论文 Figure 8。_
-
-- 单核 Wormhole：GPT 为 227×–约 745×，MoE 为 135×–510×；
-- 16-core Wormhole+Unison：GPT 峰值 1012×，MoE 峰值 716×；
-- Unison 单独峰值不足 10×；
-- HPCC、DCQCN、TIMELY 上都维持数百倍，说明收益并非绑定单一 CCA。
-
-摘要和结论把 GPT 峰值写成 744×，正文范围写成 227×–745×；更合理的理解是作图或四舍五入口径差异，不应把最后一位当成可复现精度。
-
-![稳态跳过、memoization 和事件跳过比例](/assets/img/posts/wormhole/figure-09-breakdown.png)
-_Figure 9. 左：只跳稳态已提供主要加速，memoization 继续放大；右：两种机制合计跳过超过 99% 的事件。来源：论文 Figure 9。_
-
-只做 steady-state skipping，GPT 已超过 130×、MoE 超过 50×；加入 memoization 后，GPT 跳过超过 99.5% 的 events，MoE 超过 99.2%。这也解释了为什么 dense GPT 通常比 MoE 更受益：EP all-to-all 更动态，稳定与重复程度更低。
-
-### 准确性
-
-![Wormhole 与 flow-level 模拟器的 FCT 误差](/assets/img/posts/wormhole/figure-10-fct-error.png)
-_Figure 10. Wormhole 在论文 workload 上的平均 per-flow FCT 相对误差低于 1%，flow-level 约 20%。来源：论文 Figure 10。_
-
-论文按 flow 计算相对 FCT 误差，再取平均。Wormhole 在不同网络规模和三种 CCA 下均低于 1%；只做 steady skipping 的误差更小，说明新增误差主要来自 FCG 复用，而不是稳态均值本身。
-
-此外，论文选取“每个场景的第一条 flow”，计算其所有 packet RTT 相对 ns-3 的 NRMSE，结果低于 0.005。这个指标支持 packet-level fidelity，但覆盖面比“所有 flow 的所有 packet”窄，不能把它解读成全网逐包轨迹都经过同等强度的验证。
-
-![监控指标、窗口长度和阈值的敏感性](/assets/img/posts/wormhole/figure-12-sensitivity.png)
-_Figure 12. rate / inflight / queue 三类指标表现接近；窗口与阈值共同控制速度—误差权衡。来源：论文 Figure 12。_
-
-这张图还暴露了一处正文笔误：图和判定式都说明 $l$ 越大，等待窗口越长、speedup 越低；$\theta$ 越大，条件越宽松、speedup 和 error 越高。论文正文却写成“$l$ 增大或 $\theta$ 减小会更容易进入稳态”，方向正好相反。
-
-### 真实训练 trace
-
-![真实 GPT-18B trace 上的速度与端到端误差](/assets/img/posts/wormhole/figure-14-real-trace.png)
-_Figure 14. 真实 256-GPU GPT-18B trace 上，Wormhole 仍有约百倍加速；端到端训练时间误差约 3%。来源：论文 Figure 14。_
-
-真实实验来自 256 GPU 的 GPT-18B，使用 Nsight Compute 收集 operation-level collective latency：
-
-- Wormhole 相对 ns-3：97.75×；
-- Wormhole+Unison：133.35×；
-- Wormhole 的端到端训练时间误差：3.02%；
-- ASTRA-sim+ns-3 的对应误差：3.01%。
-
-这比理想化 SimAI workload 的峰值低很多，但更有参考价值。真实 trace 包含 recomputation 和硬件性能波动，重复模式更复杂。也要区分两个误差口径：**“<1%”是合成 workload 的平均 per-flow FCT；真实 trace 的端到端训练时间误差是 3.02%。**
-
-## 几个不能被 headline 掩盖的问题
-
-### 1. “9 小时降到 5 分钟”并不是 1000×
-
-论文正文同时写道：128-GPU GPT-13B 从 9 小时缩短到 5 分钟，并“超过 1000×”。但 $9\text{ hours}/5\text{ minutes}=108\times$，不是 1000×；若真是 1012×，9 小时应降至约 32 秒。
-
-Figure 8 的相对加速曲线确实接近 1000×，所以更可能是绝对时间或文字表述中至少有一处错误。没有公开的最终脚本与原始日志时，无法判断哪一个数字正确。博客或二次引用时应把这两组陈述分开，而不是合并成一个结论。
-
-### 2. 理论上界不是实验中的 1%
-
-$\theta=5\%$ 对应的 rate / duration 理论上界约为 5.26% / 5%。低于 1% 是在特定拓扑、模型和 CCA 上测得的平均 FCT，不是逐流 worst-case guarantee。
-
-### 3. 收益高度依赖 workload 结构
-
-固定 collective、长 elephant flows、稳定路径和可预测扰动最适合 Wormhole。多租户、短流密集、随机路由、频繁故障或动态负载均衡会减少 cache hit 与 steady interval。论文认为最坏情况下可退化回原始 ns-3 且不额外损失准确性，但没有用一个强随机、多租户 workload 系统刻画退化曲线。
-
-### 4. 数据库大小也有一处图文冲突
-
-Appendix H 写道，1024-GPU 场景的 simulation database 小于 100 KB；但同页 Figure 15b 的曲线约为 GPT 370 KB、MoE 510 KB。更稳妥的结论是“仍小于约 0.6 MB、适合内存驻留”，而不是照抄 `<100 KB`。
-
-## Code archaeology：论文和公开 artifact 之间隔着什么
-
-截至 2026-08-14，我没有找到最终 NSDI '26 Wormhole 的公开 GitHub 仓库，USENIX 与 arXiv 页面也没有列出正式 artifact。一个重要线索藏在作者上传的 arXiv LaTeX 源码里：被注释掉的脚注指向一个 [anonymous.4open.science 快照](https://anonymous.4open.science/api/repo/Wormhole/zip)。该快照元数据显示最后更新于 2025-01-30，明显早于最终论文。
-
-我下载并逐层检查了这个快照。它基于 Alibaba 的 [High-Precision-Congestion-Control](https://github.com/alibaba-edu/High-Precision-Congestion-Control) ns-3 工程，许可证为 GPL v2，但更准确的称呼是**早期 steady-state-skipping prototype**。
-
-| 最终论文描述 | 匿名 artifact 中观察到的状态 |
-| --- | --- |
-| FCG、weighted graph isomorphism、memoization DB | 未找到实现 |
-| 动态 port-level partition | 有代码，但 flow 加入/退出的主要逻辑被整段注释 |
-| 每个 partition 独立进入稳态和快进 | 活跃路径要求所有 active QP 一起稳定，更接近全局快进 |
-| 每 partition event timestamp offset | 实现会遍历并偏移全局 event queue，例外保存部分 flow-start events |
-| packet pausing / shared-buffer occupancy | 未找到对应实现 |
-| 通用 interrupt queue 与 skip-back | 只看到后续 flow-start EventId 的保存，未看到完整机制 |
-| Wormhole+Unison 与并发 DB | 未找到 |
-| 论文默认 $l=2000,\theta=5\%$ | 代码硬编码 $l=1000,\theta=3\%$ |
-
-早期代码确实能看到核心雏形：每微秒采样 QP 速率、用 $(max-min)/avg$ 判稳、估计下一流到达或最早完成时间、扣减剩余字节，并调用 simulator event offset。它也暴露了一些尚未解释的工程细节，例如快进数据量使用 `average_rate / 1.07` 修正。
-
-复现摩擦同样较高：README 大部分仍是上游 HPCC 文档，构建脚本依赖 gcc-5 / Python 2 且有路径问题，没有 Wormhole 专用测试，随附的部分结果文件为空。我没有在当前环境强行修改旧依赖把它“修到能跑”，因为那样得到的是我们自己的移植版，不再是对作者 artifact 原样可复现性的检验。
-
-> 因此，这个快照可以证明作者早期实现过“稳态检测 + 事件快进”的主干，但不能证明最终论文的 memoization、partition-local correctness 和 744× / 1012× 结果可由公开代码复现。
-{: .prompt-danger }
-
-## 我怎样评价这篇论文
-
-### 做得好的地方
-
-1. **问题选得准**：它没有继续堆硬件并行，而是直接消除重复事件，能与多核优化叠加；
-2. **抽象层次漂亮**：partition 负责隔离依赖，FCG 负责识别重复 transient，rate window 负责识别 steady interval；
-3. **实现意识强**：packet pausing、timestamp offset、interrupt termination 都是在真实 DES 内核里必须处理的问题；
-4. **真实 trace 仍有效**：虽然从千倍降到百倍，但没有在现实扰动下完全失效；
-5. **误差—加速关系可调**：$l$ 和 $\theta$ 把“更早跳过”与“更保守识别”放在一个可解释旋钮上。
-
-### 仍需补强的地方
-
-1. 最终实现和原始实验没有正式公开，reproducibility 是当前最大缺口；
-2. FCG 忽略绝对位置与路径长度的安全边界缺少专门消融；
-3. packet RTT 只覆盖每个场景第一条 flow，tail behavior 验证仍偏窄；
-4. TP / SP flows 被忽略，不能直接代表包含所有并行维度的端到端通信；
-5. 动态、多租户和高 churn workload 的退化规律仍不清楚；
-6. 论文存在 9h→5min 与 1000× 的明显数字矛盾。
-
-## 值得带走的研究方法
-
-Wormhole 最值得借鉴的未必是某个 ns-3 patch，而是一套寻找仿真冗余的工作流：
-
-1. 先统计事件中有多少结构重复、多少时间处于稳态；
-2. 找到能够隔离因果依赖的最细 partition；
-3. 为 transient 设计 canonical key，为 steady state 设计可验证判据；
-4. 明确所有能结束稳态的 interrupt；
-5. 保留跨 partition 可见的共享状态；
-6. 用 packet-level baseline 同时验证速度、FCT、RTT 和 tail behavior；
-7. 把真实 trace 与合成 workload 的结果分开报告。
-
-这条路线还可以扩展到 collective simulation、storage I/O、accelerator interconnect 甚至其他 DES 系统：**先证明一段状态演化可复用或可闭式推进，再省掉事件，而不是先降低模型精度。**
-
-## 最终结论
-
-Wormhole 是一篇很有启发性的系统论文。它解释了为什么 LLM 训练的 PLDES 会慢，也展示了“结构重复 + 动力学稳态”如何转化成真正的内核级加速。就论文证据而言，合成 workload 上数百倍、真实 trace 上约百倍的方向可信且有价值。
-
-但如果问题换成“今天能否下载代码并复现 1012×”，答案仍然是否定的：能访问的匿名 artifact 不是最终实现，关键模块缺失，论文内还有未解释的数字冲突。最准确的评价是：**方法值得认真研究，结果值得期待，工程复现尚未闭环。**
+Wormhole 没有把包级仿真换成粗糙模型，而是学会判断哪些包事件不必重放。最大的收益来自快进长稳态，memoization 是第二层放大，多核并行再叠在上面。这个想法很漂亮、真实 trace 也有约百倍收益，但公开代码离最终论文仍有明显距离。
 
 ---
 
-图表来自 Long et al., *Supercharging Packet-level Network Simulation of Large Model Training via Memoization and Fast-Forwarding*, [arXiv:2602.10615v1](https://arxiv.org/abs/2602.10615)，按 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) 使用；为网页排版做了裁切与组合，数据未修改。最后核验日期：2026-08-14。
+论文图表来自 Long et al., *Supercharging Packet-level Network Simulation of Large Model Training via Memoization and Fast-Forwarding*，[arXiv:2602.10615v1](https://arxiv.org/abs/2602.10615)。
+
+原图按 [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) 使用；为网页排版做了裁切与组合，数据未修改。
+
+自绘图由 burger / Parallel Bites 根据论文机制重新绘制，不代表论文原图。最后核验日期：2026-08-14。

@@ -18,3 +18,12 @@ structure, approximation boundaries, and reproducibility.
 - [Browse the complete series](/categories/network-simulation-acceleration/)
 
 More tracks will be added as the notes grow.
+
+## AI Infrastructure at Scale
+
+Production AI systems are shaped by the boundaries between models, collective
+libraries, accelerators, networks, and operations. This track follows those boundaries
+through real deployments rather than treating each layer in isolation.
+
+- [当一条流就能吃满 400G：Meta 如何把以太网变成 AI 训练网络](/posts/meta-roce-ai-training-network/)
+- [Browse the complete track](/categories/ai-infrastructure/)

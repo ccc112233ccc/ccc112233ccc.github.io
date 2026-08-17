@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="942" viewBox="0 0 1800 942" role="img" aria-labelledby="title desc">
+  <title id="title">RoCE backend network for distributed AI training</title>
+  <desc id="desc">GPU nodes send high-bandwidth collective traffic through a dedicated Ethernet Clos fabric, with a highlighted congestion hotspot and receiver-driven admission.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1225"/>
+      <stop offset="1" stop-color="#132c45"/>
+    </linearGradient>
+    <linearGradient id="flow" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#62d9ff"/>
+      <stop offset="1" stop-color="#59f0bb"/>
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="9" result="blur"/>
+      <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <rect width="1800" height="942" fill="url(#bg)"/>
+  <circle cx="1450" cy="120" r="330" fill="#143b54" opacity=".45"/>
+  <circle cx="240" cy="850" r="360" fill="#102f4c" opacity=".55"/>
+
+  <g font-family="Inter,Arial,sans-serif">
+    <text x="110" y="130" fill="#8ba5bd" font-size="30" letter-spacing="8">AI TRAINING BACKEND</text>
+    <text x="110" y="205" fill="#f3f8fc" font-size="62" font-weight="700">RoCE at Meta Scale</text>
+    <text x="110" y="258" fill="#9db5c8" font-size="28">Low entropy · Bursty collectives · 400G elephant flows</text>
+  </g>
+
+  <g stroke="#78a2bb" stroke-width="3" fill="#172d43">
+    <rect x="120" y="390" width="240" height="126" rx="20"/>
+    <rect x="120" y="615" width="240" height="126" rx="20"/>
+    <rect x="1440" y="390" width="240" height="126" rx="20"/>
+    <rect x="1440" y="615" width="240" height="126" rx="20"/>
+  </g>
+  <g fill="#62d9ff" opacity=".9">
+    <rect x="150" y="420" width="54" height="54" rx="8"/><rect x="217" y="420" width="54" height="54" rx="8"/><rect x="284" y="420" width="46" height="54" rx="8"/>
+    <rect x="150" y="645" width="54" height="54" rx="8"/><rect x="217" y="645" width="54" height="54" rx="8"/><rect x="284" y="645" width="46" height="54" rx="8"/>
+    <rect x="1470" y="420" width="54" height="54" rx="8"/><rect x="1537" y="420" width="54" height="54" rx="8"/><rect x="1604" y="420" width="46" height="54" rx="8"/>
+    <rect x="1470" y="645" width="54" height="54" rx="8"/><rect x="1537" y="645" width="54" height="54" rx="8"/><rect x="1604" y="645" width="46" height="54" rx="8"/>
+  </g>
+  <g fill="#dceaf3" font-family="Inter,Arial,sans-serif" font-size="24" font-weight="600">
+    <text x="160" y="503">GPU NODE</text><text x="160" y="728">GPU NODE</text>
+    <text x="1480" y="503">GPU NODE</text><text x="1480" y="728">GPU NODE</text>
+  </g>
+
+  <g fill="#1a4560" stroke="#73d8f5" stroke-width="3">
+    <rect x="500" y="365" width="190" height="96" rx="18"/>
+    <rect x="500" y="670" width="190" height="96" rx="18"/>
+    <rect x="805" y="455" width="190" height="96" rx="18"/>
+    <rect x="805" y="590" width="190" height="96" rx="18"/>
+    <rect x="1110" y="365" width="190" height="96" rx="18"/>
+    <rect x="1110" y="670" width="190" height="96" rx="18"/>
+  </g>
+  <g fill="#d9f5ff" font-family="Inter,Arial,sans-serif" font-size="24" text-anchor="middle">
+    <text x="595" y="424">LEAF</text><text x="595" y="729">LEAF</text>
+    <text x="900" y="514">SPINE</text><text x="900" y="649">SPINE</text>
+    <text x="1205" y="424">LEAF</text><text x="1205" y="729">LEAF</text>
+  </g>
+
+  <g fill="none" stroke="url(#flow)" stroke-width="9" opacity=".9" filter="url(#glow)">
+    <path d="M360 453 C420 453 430 413 500 413"/>
+    <path d="M360 678 C420 678 430 718 500 718"/>
+    <path d="M690 413 C755 413 760 503 805 503"/>
+    <path d="M690 718 C755 718 760 638 805 638"/>
+    <path d="M995 503 C1040 503 1045 413 1110 413"/>
+    <path d="M995 638 C1040 638 1045 718 1110 718"/>
+    <path d="M1300 413 C1370 413 1380 453 1440 453"/>
+    <path d="M1300 718 C1370 718 1380 678 1440 678"/>
+  </g>
+  <g fill="none" stroke="#f4a340" stroke-width="15" opacity=".95" filter="url(#glow)">
+    <path d="M690 413 C755 413 760 503 805 503"/>
+    <path d="M690 718 C755 718 760 503 805 503"/>
+  </g>
+  <circle cx="800" cy="503" r="20" fill="#ff5d5d" filter="url(#glow)"/>
+  <g font-family="Inter,Arial,sans-serif" font-size="25">
+    <text x="738" y="344" fill="#f6b85c">HASH COLLISION</text>
+    <text x="746" y="812" fill="#8ba5bd">Dedicated Ethernet fabric · workload-aware routing · receiver-driven admission</text>
+  </g>
+</svg>
